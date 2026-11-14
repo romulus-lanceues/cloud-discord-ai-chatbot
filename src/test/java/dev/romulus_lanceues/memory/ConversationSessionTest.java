@@ -40,18 +40,86 @@ public class ConversationSessionTest {
 
     }
 
+    @Test
+    void expiredInsertionPreservesFullHistoryAndLastActivity() {
+        MutableClock clock = new MutableClock(Instant.parse("2026-01-01T12:00:00Z"));
+        ConversationSession session = new ConversationSession(123L, ConversationTurn.user("Alice", "Hello"), clock);
+        for (int i = 1; i <= 7; i++) {
+            session.insertConversationTurn(ConversationTurn.user("Alice", "Turn " + i), TTL);
+        }
+        List<ConversationTurn> history = session.getTurns();
+        assertEquals(7, history.size());
+        Instant lastActivity = session.getLastActivity();
+        clock.advance(TTL.plusNanos(1));
+
+        assertThrows(IllegalStateException.class,
+                () -> session.insertConversationTurn(ConversationTurn.bot("Too late"), TTL));
+
+        assertEquals(history, session.getTurns());
+        assertEquals(lastActivity, session.getLastActivity());
+        assertFalse(session.verifyStateEligibility(TTL));
+    }
+
+    @Test
+    void inactiveSessionRemainsInactiveEvenWithLongerTtl() {
+        ConversationSession session = new ConversationSession(123L, ConversationTurn.user("Alice", "Hello"), TEST_CLOCK);
+        session.makeSessionInactive();
+
+        assertFalse(session.verifyStateEligibility(Duration.ofDays(1)));
+        assertThrows(IllegalStateException.class,
+                () -> session.insertConversationTurn(ConversationTurn.bot("Rejected"), Duration.ofDays(1)));
+        assertTrue(session.getTurns().isEmpty());
+    }
+
+    private static final Duration TTL = Duration.ofMinutes(45);
+
     private static final Clock TEST_CLOCK = Clock.fixed(Instant.parse("2026-01-01T12:00:00Z"), ZoneOffset.UTC);
+
+    @Test
+    void contextKeepsInitialDirectiveFirstAfterPruning() {
+        ConversationTurn initial = new ConversationTurn("Alice", "Answer in Spanish", TEST_CLOCK.instant(), false);
+        ConversationSession session = new ConversationSession(123L, initial, TEST_CLOCK);
+        List<ConversationTurn> subsequentTurns = new ArrayList<>();
+        for (int i = 1; i <= 23; i++) {
+            ConversationTurn turn = ConversationTurn.user("Bob", "Message " + i);
+            session.insertConversationTurn(turn, TTL);
+            subsequentTurns.add(turn);
+        }
+
+        List<ConversationTurn> expected = new ArrayList<>();
+        expected.add(initial);
+        expected.addAll(subsequentTurns.subList(16, 23));
+        assertEquals(expected, session.getActiveTurns());
+        assertEquals(8, session.getActiveTurns().size());
+        assertSame(initial, session.getActiveTurns().getFirst());
+        assertEquals(7, session.getTurns().size());
+        assertFalse(session.getTurns().contains(initial));
+    }
+
+    @Test
+    void contextIsAnImmutableIndependentSnapshot() {
+        ConversationTurn initial = ConversationTurn.user("Alice", "Answer in Spanish");
+        ConversationSession session = new ConversationSession(123L, initial, TEST_CLOCK);
+        List<ConversationTurn> snapshot = session.getActiveTurns();
+        ConversationTurn reply = ConversationTurn.bot("Hola");
+
+        assertThrows(UnsupportedOperationException.class, () -> snapshot.add(reply));
+        session.insertConversationTurn(reply, TTL);
+
+        assertEquals(List.of(initial), snapshot);
+        assertEquals(List.of(initial, reply), session.getActiveTurns());
+    }
 
     @Test
     public void testSessionCreation(){
         long threadId = 423543241L;
         String initialPrompt = "Test Prompt";
 
-        ConversationSession session = new ConversationSession(threadId, initialPrompt, TEST_CLOCK);
+        ConversationSession session = new ConversationSession(threadId, ConversationTurn.user("Alice", initialPrompt), TEST_CLOCK);
 
         assertEquals(threadId, session.getThreadId());
-        assertEquals(initialPrompt, session.getInitialPrompt());
-        assertNotNull(session.getLastActivity());
+        assertEquals(initialPrompt, session.getInitialPrompt().content());
+        assertEquals(TEST_CLOCK.instant(), session.getLastActivity());
         assertTrue(session.getTurns().isEmpty());
     }
 
@@ -60,17 +128,13 @@ public class ConversationSessionTest {
         assertThrows(NullPointerException.class, () -> new ConversationSession(21376176L, null, TEST_CLOCK));
     }
 
-    @Test
-    public void rejectEmptyInitialPrompt(){
-        assertThrows(IllegalArgumentException.class, () -> new ConversationSession(21376176L, "", TEST_CLOCK));
-    }
 
     @Test
     public void addsTurnToHistory(){
         ConversationTurn userTurn = ConversationTurn.user("Iroha", "What is a square root?");
-        ConversationSession conversationSession = new ConversationSession(351531L, "Act as Maths tutor", TEST_CLOCK);
+        ConversationSession conversationSession = new ConversationSession(351531L, ConversationTurn.user("Alice", "Act as Maths tutor"), TEST_CLOCK);
 
-        conversationSession.addTurn(userTurn);
+        conversationSession.insertConversationTurn(userTurn, TTL);
 
         assertEquals(1, conversationSession.getTurns().size());
         assertEquals(userTurn, conversationSession.getTurns().getFirst());
@@ -78,19 +142,19 @@ public class ConversationSessionTest {
 
     @Test
     public void rejectNullTurnInsertion(){
-        ConversationSession conversationSession = new ConversationSession(351531L, "Talk in Spanish", TEST_CLOCK);
+        ConversationSession conversationSession = new ConversationSession(351531L, ConversationTurn.user("Alice", "Talk in Spanish"), TEST_CLOCK);
 
-        assertThrows(NullPointerException.class, () -> conversationSession.addTurn(null));
+        assertThrows(NullPointerException.class, () -> conversationSession.insertConversationTurn(null, TTL));
     }
 
     @Test
     public void verifyInsertionOrder(){
         ConversationTurn conversationTurn1 = ConversationTurn.user("Dante", "What is a noun?");
         ConversationTurn conversationTurn2 = ConversationTurn.user("Sally", "What is a verb?");
-        ConversationSession conversationSession = new ConversationSession(237127631L, "Act as an English tutor", TEST_CLOCK);
+        ConversationSession conversationSession = new ConversationSession(237127631L, ConversationTurn.user("Alice", "Act as an English tutor"), TEST_CLOCK);
 
-        conversationSession.addTurn(conversationTurn1);
-        conversationSession.addTurn(conversationTurn2);
+        conversationSession.insertConversationTurn(conversationTurn1, TTL);
+        conversationSession.insertConversationTurn(conversationTurn2, TTL);
 
         assertEquals(2, conversationSession.getTurns().size());
         assertEquals(conversationTurn1, conversationSession.getTurns().getFirst());
@@ -98,61 +162,64 @@ public class ConversationSessionTest {
     }
 
     @Test
-    public void historyCap(){
-        ConversationSession conversationSession = new ConversationSession(351531L, "Test conversation", TEST_CLOCK);
+    public void sevenRollingTurnsFitAlongsidePinnedPrompt(){
+        ConversationSession conversationSession = new ConversationSession(351531L, ConversationTurn.user("Alice", "Test conversation"), TEST_CLOCK);
         List<ConversationTurn> expectedConversationTurns = new ArrayList<>();
 
-        for(int i = 1; i <= 20 ; i++){
+        for(int i = 1; i <= 7 ; i++){
             ConversationTurn conversationTurn = ConversationTurn.user("Minju", "Prompt No." + i);
-            conversationSession.addTurn(conversationTurn);
+            conversationSession.insertConversationTurn(conversationTurn, TTL);
             expectedConversationTurns.add(conversationTurn);
         }
 
-        assertEquals(20, conversationSession.getTurns().size());
+        assertEquals(7, conversationSession.getTurns().size());
+        assertEquals(8, conversationSession.getActiveTurns().size());
         assertEquals("Prompt No.1", conversationSession.getTurns().getFirst().content());
-        assertEquals("Prompt No.20", conversationSession.getTurns().getLast().content());
+        assertEquals("Prompt No.7", conversationSession.getTurns().getLast().content());
         assertEquals(expectedConversationTurns, conversationSession.getTurns());
     }
 
     @Test
-    public void keepTheNewestTwentyTurn(){
-        ConversationSession conversationSession =  new ConversationSession(237127631L, "Random chat", TEST_CLOCK);
-        List<ConversationTurn> lastTwentyTurns = new ArrayList<>();
+    public void eighthRollingTurnEvictsOldestAndKeepsNewestSeven(){
+        ConversationSession conversationSession =  new ConversationSession(237127631L, ConversationTurn.user("Alice", "Random chat"), TEST_CLOCK);
+        List<ConversationTurn> newestSevenTurns = new ArrayList<>();
 
-        for(int i = 1; i <= 21 ; i++){
+        for(int i = 1; i <= 8 ; i++){
             ConversationTurn conversationTurn =  ConversationTurn.user("Moka", "Prompt No." + i);
-            conversationSession.addTurn(conversationTurn);
-            lastTwentyTurns.add(conversationTurn);
+            conversationSession.insertConversationTurn(conversationTurn, TTL);
+            newestSevenTurns.add(conversationTurn);
         }
 
-        lastTwentyTurns.removeFirst();
+        newestSevenTurns.removeFirst();
 
-        assertEquals(20,  conversationSession.getTurns().size());
+        assertEquals(7,  conversationSession.getTurns().size());
+        assertEquals(8, conversationSession.getActiveTurns().size());
+        assertSame(conversationSession.getInitialPrompt(), conversationSession.getActiveTurns().getFirst());
         assertEquals("Prompt No.2", conversationSession.getTurns().getFirst().content());
-        assertEquals(lastTwentyTurns,  conversationSession.getTurns());
+        assertEquals(newestSevenTurns,  conversationSession.getTurns());
     }
 
     @Test
     public void initialPromptIsPreserved(){
-        ConversationSession conversationSession = new ConversationSession(237127631L, "Test conversation", TEST_CLOCK);
+        ConversationSession conversationSession = new ConversationSession(237127631L, ConversationTurn.user("Alice", "Test conversation"), TEST_CLOCK);
 
         for(int i = 1; i <= 23 ; i++){
-            conversationSession.addTurn(ConversationTurn.user("Wonhee", "Prompt No." + i));
+            conversationSession.insertConversationTurn(ConversationTurn.user("Wonhee", "Prompt No." + i), TTL);
         }
 
-        assertEquals(20, conversationSession.getTurns().size());
-        assertEquals("Test conversation", conversationSession.getInitialPrompt());
+        assertEquals(7, conversationSession.getTurns().size());
+        assertEquals("Test conversation", conversationSession.getInitialPrompt().content());
     }
 
     @Test
     public void rejectTurnModification(){
-        ConversationSession conversationSession = new ConversationSession(27412768179L, "Test conversation", TEST_CLOCK);
+        ConversationSession conversationSession = new ConversationSession(27412768179L, ConversationTurn.user("Alice", "Test conversation"), TEST_CLOCK);
 
         ConversationTurn conversationTurn1 = ConversationTurn.user("Kurt", "Test prompt");
         ConversationTurn conversationTurn2 = ConversationTurn.user("cloud", "All apologies");
 
-        conversationSession.addTurn(conversationTurn1);
-        conversationSession.addTurn(conversationTurn2);
+        conversationSession.insertConversationTurn(conversationTurn1, TTL);
+        conversationSession.insertConversationTurn(conversationTurn2, TTL);
 
         List<ConversationTurn> conversationTurns = conversationSession.getTurns();
 
@@ -162,9 +229,9 @@ public class ConversationSessionTest {
     @Test
     public void independentSnapshot(){
         ConversationTurn conversationTurn1 = ConversationTurn.user("Claire", "What is a RuntimeException?");
-        ConversationSession conversationSession = new ConversationSession(2841819L, "Act as my Java tutor", TEST_CLOCK);
+        ConversationSession conversationSession = new ConversationSession(2841819L, ConversationTurn.user("Alice", "Act as my Java tutor"), TEST_CLOCK);
 
-        conversationSession.addTurn(conversationTurn1);
+        conversationSession.insertConversationTurn(conversationTurn1, TTL);
 
         List<ConversationTurn> initialConversationTurns = conversationSession.getTurns();
 
@@ -172,7 +239,7 @@ public class ConversationSessionTest {
 
         ConversationTurn conversationTurn2 = ConversationTurn.user("Flown", "What is a HashMap?");
 
-        conversationSession.addTurn(conversationTurn2);
+        conversationSession.insertConversationTurn(conversationTurn2, TTL);
 
         assertEquals(1, initialConversationTurns.size());
         assertEquals(List.of(conversationTurn1), initialConversationTurns);
@@ -182,7 +249,7 @@ public class ConversationSessionTest {
 
     @Test
     public void acquisitionLock(){
-        ConversationSession conversationSession = new ConversationSession(237127631L, "Test conversation", TEST_CLOCK);
+        ConversationSession conversationSession = new ConversationSession(237127631L, ConversationTurn.user("Alice", "Test conversation"), TEST_CLOCK);
 
         //Lock acquired
         boolean result = conversationSession.tryAcquireLock();
@@ -203,11 +270,11 @@ public class ConversationSessionTest {
     @Test
     public void expectSessionNotExpired(){
         MutableClock mutableClock = new MutableClock(Instant.parse("2026-01-01T12:00:00Z"));
-        ConversationSession conversationSession = new ConversationSession(237127631L, "Test conversation", mutableClock);
+        ConversationSession conversationSession = new ConversationSession(237127631L, ConversationTurn.user("Alice", "Test conversation"), mutableClock);
 
         mutableClock.advance(Duration.ofMinutes(10));
 
-        assertFalse(conversationSession.isExpired(Duration.ofMinutes(45)));
+        assertTrue(conversationSession.verifyStateEligibility(TTL));
         assertEquals(Instant.parse("2026-01-01T12:10:00Z"), mutableClock.instant());
 
     }
@@ -215,29 +282,29 @@ public class ConversationSessionTest {
     @Test
     public void stillNotExpiredAtExactly45Minutes(){
         MutableClock mutableClock = new MutableClock(Instant.parse("2026-01-01T12:00:00Z"));
-        ConversationSession conversationSession = new ConversationSession(237127631L, "Test conversation", mutableClock);
+        ConversationSession conversationSession = new ConversationSession(237127631L, ConversationTurn.user("Alice", "Test conversation"), mutableClock);
 
         mutableClock.advance(Duration.ofMinutes(45));
 
-        assertFalse(conversationSession.isExpired(Duration.ofMinutes(45)));
+        assertTrue(conversationSession.verifyStateEligibility(TTL));
         assertEquals(Instant.parse("2026-01-01T12:45:00Z"), mutableClock.instant());
     }
 
     @Test
     public void expectSessionExpired(){
         MutableClock mutableClock = new MutableClock(Instant.parse("2026-01-01T12:00:00Z"));
-        ConversationSession conversationSession = new ConversationSession(237127631L, "Test conversation", mutableClock);
+        ConversationSession conversationSession = new ConversationSession(237127631L, ConversationTurn.user("Alice", "Test conversation"), mutableClock);
 
         mutableClock.advance(Duration.ofMinutes(45).plusNanos(1));
 
-        assertTrue(conversationSession.isExpired(Duration.ofMinutes(45)));
+        assertFalse(conversationSession.verifyStateEligibility(TTL));
         assertEquals(Instant.parse("2026-01-01T12:45:00.000000001Z"), mutableClock.instant());
     }
 
     @Test
     public void activityResetsLastActivity(){
         MutableClock mutableClock = new MutableClock(Instant.parse("2026-01-01T12:00:00Z"));
-        ConversationSession conversationSession = new ConversationSession(237127631L, "Test conversation", mutableClock);
+        ConversationSession conversationSession = new ConversationSession(237127631L, ConversationTurn.user("Alice", "Test conversation"), mutableClock);
 
         assertEquals(Instant.parse("2026-01-01T12:00:00Z"), mutableClock.instant());
 
@@ -246,15 +313,15 @@ public class ConversationSessionTest {
 
         //New activity happened
         ConversationTurn conversationTurn = ConversationTurn.user("Noel", "Test prompt");
-        conversationSession.addTurn(conversationTurn);
+        conversationSession.insertConversationTurn(conversationTurn, TTL);
 
-        assertEquals(Instant.parse("2026-01-01T12:30:00Z"), mutableClock.instant());
+        assertEquals(Instant.parse("2026-01-01T12:30:00Z"), conversationSession.getLastActivity());
 
         //Advance clock for another 30 minutes
         mutableClock.advance(Duration.ofMinutes(30));
 
         //Make sure session is still not expired
-        assertFalse(conversationSession.isExpired(Duration.ofMinutes(45)));
+        assertTrue(conversationSession.verifyStateEligibility(TTL));
         assertEquals(Instant.parse("2026-01-01T13:00:00Z"), mutableClock.instant());
     }
 
