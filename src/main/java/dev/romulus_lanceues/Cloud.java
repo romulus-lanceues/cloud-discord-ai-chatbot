@@ -51,7 +51,7 @@ public class Cloud {
         List<SlashCommandHandler> commandHandlers = List.of(
                 new CloudCommand(),
                 new AskCommand(chatService, rateLimiter),
-                new ConversationCommand()
+                new ConversationCommand(rateLimiter, conversationManager, chatService)
         );
 
         SlashCommandListener slashCommandListener = new SlashCommandListener(commandHandlers);
