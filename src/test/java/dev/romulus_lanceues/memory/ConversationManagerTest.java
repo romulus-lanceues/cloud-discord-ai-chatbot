@@ -58,6 +58,34 @@ public class ConversationManagerTest {
     private ScheduledFuture<?> cleanupTask;
 
     @Test
+    void registeredSessionIsReservedForInitialResponseUntilOwnerReleasesIt() {
+        ConversationManager manager = new ConversationManager(Clock.systemUTC(), executor);
+        ConversationSession created = manager.createSession(123L, "Hello", "Alice");
+        ConversationSession visible = manager.getSession(123L).orElseThrow();
+
+        assertSame(created, visible);
+        assertFalse(visible.tryAcquireLock(), "A registered session must already be reserved for its initial response");
+        created.releaseLock();
+        assertTrue(visible.tryAcquireLock());
+        visible.releaseLock();
+    }
+
+    @Test
+    void duplicateCreationDoesNotChangeExistingSessionsGuardOwnership() {
+        ConversationManager manager = new ConversationManager(Clock.systemUTC(), executor);
+        ConversationSession original = manager.createSession(123L, "Original", "Alice");
+
+        assertThrows(IllegalStateException.class, () -> manager.createSession(123L, "Duplicate", "Bob"));
+        assertFalse(original.tryAcquireLock());
+        original.releaseLock();
+
+        assertThrows(IllegalStateException.class, () -> manager.createSession(123L, "Another duplicate", "Bob"));
+        assertSame(original, manager.getSession(123L).orElseThrow());
+        assertTrue(original.tryAcquireLock(), "Rejected creation must not reserve the existing session again");
+        original.releaseLock();
+    }
+
+    @Test
     void initialDirectivePreservesAuthorContentAndInjectedTime() {
         Clock clock = Clock.fixed(Instant.parse("2026-01-01T12:00:00Z"), ZoneOffset.UTC);
         ConversationManager manager = new ConversationManager(clock, executor);

@@ -32,6 +32,7 @@ public class ConversationManager implements AutoCloseable {
 
         ConversationTurn initialPrompt = new ConversationTurn(initialAuthor, prompt, clock.instant(), false);
         ConversationSession session = new ConversationSession(threadId, initialPrompt, clock);
+        session.tryAcquireLock();
         ConversationSession insertionResult = sessions.putIfAbsent(threadId, session);
         //Overriding an existing session is not allowed
         if(insertionResult != null) throw new IllegalStateException("Session already exists");
