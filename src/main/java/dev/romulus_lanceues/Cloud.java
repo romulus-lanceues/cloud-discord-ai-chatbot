@@ -4,6 +4,7 @@ import com.google.genai.Client;
 import dev.romulus_lanceues.ai.ChatService;
 import dev.romulus_lanceues.ai.GeminiChatService;
 import dev.romulus_lanceues.config.Config;
+import dev.romulus_lanceues.discord.ConversationListener;
 import dev.romulus_lanceues.discord.SlashCommandHandler;
 import dev.romulus_lanceues.discord.SlashCommandListener;
 import dev.romulus_lanceues.discord.commands.AskCommand;
@@ -46,12 +47,13 @@ public class Cloud {
 
         ScheduledExecutorService executor = Executors.newSingleThreadScheduledExecutor();
         ConversationManager conversationManager = new ConversationManager(Clock.systemUTC(),executor);
+        ConversationListener conversationListener = new ConversationListener(conversationManager, chatService, rateLimiter, executor);
 
 
         List<SlashCommandHandler> commandHandlers = List.of(
                 new CloudCommand(),
                 new AskCommand(chatService, rateLimiter),
-                new ConversationCommand(rateLimiter, conversationManager, chatService)
+                new ConversationCommand(rateLimiter, conversationManager, chatService, executor)
         );
 
         SlashCommandListener slashCommandListener = new SlashCommandListener(commandHandlers);
@@ -60,7 +62,7 @@ public class Cloud {
                 .setMemberCachePolicy(MemberCachePolicy.NONE)
                 .setChunkingFilter(ChunkingFilter.NONE)
                 .disableCache(EnumSet.allOf(CacheFlag.class))
-                .addEventListeners(slashCommandListener)
+                .addEventListeners(slashCommandListener, conversationListener)
                 .build();
 
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
