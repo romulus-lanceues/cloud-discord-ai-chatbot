@@ -17,6 +17,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
 
 public class AskCommand implements SlashCommandHandler {
 
@@ -25,6 +26,7 @@ public class AskCommand implements SlashCommandHandler {
     private static final String NAME = "ask";
     private static final String DESCRIPTION = "Ask Cloud a question or prompt.";
     private static final String OPTION_PROMPT = "prompt";
+    static final String GENERATION_FAILED = "I encountered an unexpected issue while generating a response. Please try again later.";
 
     private final ChatService chatService;
     private final RateLimiter rateLimiter;
@@ -68,36 +70,54 @@ public class AskCommand implements SlashCommandHandler {
         event.deferReply().queue();
 
         String prompt = promptOption.getAsString().strip();
-        chatService.ask(prompt).whenComplete((result, throwable) -> {
-            if (throwable != null) {
-                LOG.error("Failed to process /ask request for user {}", userId, throwable);
-                event.getHook()
-                        .editOriginal("I encountered an unexpected issue while generating a response. Please try again later.")
-                        .setAllowedMentions(Collections.emptyList())
-                        .queue();
-                return;
-            }
+        try {
+            chatService.ask(prompt).whenComplete((result, throwable) -> {
+                if (throwable != null) {
+                    reportGenerationFailure(event, userId, throwable);
+                    return;
+                }
+                if (result == null || result.isBlank()) {
+                    reportGenerationFailure(event, userId, new IllegalStateException("Generated response was empty"));
+                    return;
+                }
 
-            List<String> chunks = MessageSplitter.split(result, 2000);
-            if (chunks.isEmpty()) {
-                event.getHook()
-                        .editOriginal("I encountered an unexpected issue while generating a response. Please try again later.")
-                        .setAllowedMentions(Collections.emptyList())
-                        .queue();
-                return;
-            }
+                deliverResponse(event, MessageSplitter.split(result, 2000))
+                        .whenComplete((ignored, failure) -> {
+                            if (failure != null) {
+                                LOG.error("Failed to deliver /ask response for user {}; delivery may be partial", userId, failure);
+                            }
+                        });
+            });
+        } catch (RuntimeException failure) {
+            // The service can throw before it returns a future.
+            reportGenerationFailure(event, userId, failure);
+        }
+    }
 
-            event.getHook()
-                    .editOriginal(chunks.get(0))
+    private CompletableFuture<Void> deliverResponse(SlashCommandInteractionEvent event, List<String> chunks) {
+        // Starting inside thenCompose also captures synchronous action creation/submission failures.
+        CompletableFuture<?> delivery = CompletableFuture.completedFuture(null)
+                .thenCompose(ignored -> event.getHook().editOriginal(chunks.getFirst())
+                        .setAllowedMentions(Collections.emptyList())
+                        .submit());
+        for (int i = 1; i < chunks.size(); i++) {
+            String chunk = chunks.get(i);
+            delivery = delivery.thenCompose(ignored -> event.getHook().sendMessage(chunk)
                     .setAllowedMentions(Collections.emptyList())
-                    .queue();
+                    .submit());
+        }
+        return delivery.thenRun(() -> {});
+    }
 
-            for (int i = 1; i < chunks.size(); i++) {
-                event.getHook()
-                        .sendMessage(chunks.get(i))
-                        .setAllowedMentions(Collections.emptyList())
-                        .queue();
-            }
-        });
+    private void reportGenerationFailure(SlashCommandInteractionEvent event, long userId, Throwable failure) {
+        LOG.error("Failed to process /ask request for user {}", userId, failure);
+        try {
+            event.getHook().editOriginal(GENERATION_FAILED)
+                    .setAllowedMentions(Collections.emptyList())
+                    .queue(ignored -> {}, notificationFailure ->
+                            LOG.warn("Could not send /ask failure notification for user {}", userId, notificationFailure));
+        } catch (RuntimeException notificationFailure) {
+            LOG.warn("Could not submit /ask failure notification for user {}", userId, notificationFailure);
+        }
     }
 }

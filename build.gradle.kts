@@ -8,7 +8,7 @@ plugins {
     id("com.gradleup.shadow") version "9.4.2"
 }
 
-group = "com.example"
+group = "dev.romolus_lanceues"
 version = "1.0.0"
 
 repositories {

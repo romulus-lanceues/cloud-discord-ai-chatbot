@@ -4,8 +4,11 @@ import dev.romulus_lanceues.ai.ChatService;
 import dev.romulus_lanceues.discord.commands.AskCommand;
 import dev.romulus_lanceues.discord.commands.CloudCommand;
 import dev.romulus_lanceues.discord.commands.ConversationCommand;
+import dev.romulus_lanceues.memory.ConversationManager;
+import net.dv8tion.jda.api.entities.channel.ChannelType;
 import dev.romulus_lanceues.util.RateLimiter;
 import net.dv8tion.jda.api.entities.User;
+import net.dv8tion.jda.api.entities.Message;
 import net.dv8tion.jda.api.events.interaction.command.SlashCommandInteractionEvent;
 import net.dv8tion.jda.api.interactions.InteractionHook;
 import net.dv8tion.jda.api.interactions.commands.Command;
@@ -18,13 +21,17 @@ import net.dv8tion.jda.api.requests.restaction.interactions.ReplyCallbackAction;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 
 import java.util.HashSet;
+import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.regex.Pattern;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -53,7 +60,7 @@ class CommandRegistrationIntegrationTest {
         standardHandlers = List.of(
                 new CloudCommand(),
                 new AskCommand(chatService, rateLimiter),
-                new ConversationCommand()
+                new ConversationCommand(rateLimiter, mock(ConversationManager.class), chatService, mock(ScheduledExecutorService.class))
         );
         listener = new SlashCommandListener(standardHandlers);
 
@@ -117,6 +124,24 @@ class CommandRegistrationIntegrationTest {
                 assertTrue(subDesc.length() <= 100, "Subcommand description exceeds 100 characters: " + subDesc);
             }
         }
+        assertEquals(Set.of("cloud", "ask", "conversation"), commandNames);
+    }
+
+    @Test
+    void exportedCommandNamesMatchRoutingNames() {
+        for (SlashCommandHandler handler : standardHandlers) {
+            assertEquals(handler.name(), handler.commandData().getName());
+        }
+        assertEquals(standardHandlers.stream().map(SlashCommandHandler::name).toList(),
+                listener.getCommandData().stream().map(SlashCommandData::getName).toList());
+    }
+
+    @Test
+    void exportedCommandNamesMatchTheirHandlerRoutingNames() {
+        for (SlashCommandHandler handler : standardHandlers) {
+            assertEquals(handler.name(), handler.commandData().getName(),
+                    "Exported command name must match the dispatch key for " + handler.getClass().getSimpleName());
+        }
     }
 
     @Test
@@ -152,6 +177,7 @@ class CommandRegistrationIntegrationTest {
         WebhookMessageEditAction editAction = mock(WebhookMessageEditAction.class);
         when(hook.editOriginal(anyString())).thenReturn(editAction);
         when(editAction.setAllowedMentions(any())).thenReturn(editAction);
+        when(editAction.submit()).thenReturn(CompletableFuture.completedFuture(mock(Message.class)));
 
         when(chatService.ask("What is Cloud?"))
                 .thenReturn(CompletableFuture.completedFuture("Cloud is an AI assistant."));
@@ -161,22 +187,78 @@ class CommandRegistrationIntegrationTest {
         verify(event.deferReply()).queue();
         verify(chatService).ask("What is Cloud?");
         verify(hook).editOriginal("Cloud is an AI assistant.");
+        verify(editAction).setAllowedMentions(Collections.emptyList());
+        verify(editAction).submit();
     }
 
     @Test
-    @DisplayName("Routes /conversation command interaction through listener successfully")
-    void routesConversationCommandThroughListener() {
+    void validConversationRoutesThroughCreationMemoryAndMultiTurnService() {
+        ConversationTestFixture fixture = new ConversationTestFixture();
+        var conversation = fixture.slash("conversation", "Answer in Spanish");
+
+        fixture.commands.onSlashCommandInteraction(conversation);
+
+        verify(fixture.parent).createThreadChannel("Cloud Conversation Thread");
+        verify(fixture.thread).addThreadMember(conversation.getUser());
+        verify(conversation.getHook()).editOriginal("Your conversation has been created!<#123>");
+        assertEquals(1, fixture.chat.contexts.size());
+        var initial = fixture.chat.contexts.getFirst().getFirst();
+        assertEquals("Alice", initial.speaker());
+        assertEquals("Answer in Spanish", initial.content());
+        assertFalse(initial.isBot());
+        var session = fixture.manager.getSession(ConversationTestFixture.THREAD_ID).orElseThrow();
+        assertSame(initial, session.getInitialPrompt());
+        assertEquals(List.of("Answer 1"), fixture.delivered);
+        assertEquals("Answer 1", session.getTurns().getFirst().content());
+        assertTrue(session.tryAcquireLock());
+        session.releaseLock();
+        assertTrue(fixture.chat.asks.isEmpty());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"ask", "conversation"})
+    void commandsShareTheSameUsersCooldown(String firstCommand) {
+        ConversationTestFixture fixture = new ConversationTestFixture();
+        fixture.commands.onSlashCommandInteraction(fixture.slash(firstCommand, "First request"));
+        String secondCommand = firstCommand.equals("ask") ? "conversation" : "ask";
+        var blocked = fixture.slash(secondCommand, "Second request");
+        ReplyCallbackAction denied = mock(ReplyCallbackAction.class, RETURNS_SELF);
+        when(blocked.reply(anyString())).thenReturn(denied);
+
+        fixture.commands.onSlashCommandInteraction(blocked);
+
+        ArgumentCaptor<String> notice = ArgumentCaptor.forClass(String.class);
+        verify(blocked).reply(notice.capture());
+        assertTrue(notice.getValue().contains("Please wait 5 seconds"));
+        verify(denied).setEphemeral(true);
+        verify(denied).queue();
+        verify(blocked, never()).deferReply();
+        assertEquals(firstCommand.equals("ask") ? List.of("First request") : List.of(), fixture.chat.asks);
+        assertEquals(firstCommand.equals("conversation") ? 1 : 0, fixture.chat.contexts.size());
+        if (firstCommand.equals("ask")) {
+            verify(fixture.parent, never()).createThreadChannel(anyString());
+            assertTrue(fixture.manager.getSession(ConversationTestFixture.THREAD_ID).isEmpty());
+            verifyNoInteractions(fixture.scheduler);
+        }
+    }
+
+    @Test
+    @DisplayName("Routes /conversation to its input validation")
+    void routesConversationCommandToValidation() {
         when(event.getName()).thenReturn("conversation");
+        when(event.getChannelType()).thenReturn(ChannelType.TEXT);
         OptionMapping promptOption = mock(OptionMapping.class);
-        when(promptOption.getAsString()).thenReturn("Start conversation");
-        when(event.getOption("prompt")).thenReturn(promptOption);
+        when(promptOption.getAsString()).thenReturn("   ");
+        when(event.getOption("instructions")).thenReturn(promptOption);
 
         listener.onSlashCommandInteraction(event);
 
         ArgumentCaptor<String> captor = ArgumentCaptor.forClass(String.class);
         verify(event).reply(captor.capture());
         verify(replyAction).queue();
-        assertTrue(captor.getValue().contains("Start conversation"));
+        assertEquals("Please provide a non-empty prompt.", captor.getValue());
+        verify(replyAction).setEphemeral(true);
+        verifyNoInteractions(chatService, rateLimiter);
     }
 
     @Test

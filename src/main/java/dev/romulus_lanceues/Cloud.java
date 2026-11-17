@@ -4,11 +4,13 @@ import com.google.genai.Client;
 import dev.romulus_lanceues.ai.ChatService;
 import dev.romulus_lanceues.ai.GeminiChatService;
 import dev.romulus_lanceues.config.Config;
+import dev.romulus_lanceues.discord.ConversationListener;
 import dev.romulus_lanceues.discord.SlashCommandHandler;
 import dev.romulus_lanceues.discord.SlashCommandListener;
 import dev.romulus_lanceues.discord.commands.AskCommand;
 import dev.romulus_lanceues.discord.commands.CloudCommand;
 import dev.romulus_lanceues.discord.commands.ConversationCommand;
+import dev.romulus_lanceues.memory.ConversationManager;
 import dev.romulus_lanceues.util.RateLimiter;
 import net.dv8tion.jda.api.JDA;
 import net.dv8tion.jda.api.JDABuilder;
@@ -19,9 +21,12 @@ import net.dv8tion.jda.api.utils.cache.CacheFlag;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.time.Clock;
 import java.time.Duration;
 import java.util.EnumSet;
 import java.util.List;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 
 public class Cloud {
 
@@ -40,10 +45,15 @@ public class Cloud {
         ChatService chatService = new GeminiChatService(client, config.geminiConfig());
         RateLimiter rateLimiter = new RateLimiter(Duration.ofSeconds(5));
 
+        ScheduledExecutorService executor = Executors.newSingleThreadScheduledExecutor();
+        ConversationManager conversationManager = new ConversationManager(Clock.systemUTC(),executor);
+        ConversationListener conversationListener = new ConversationListener(conversationManager, chatService, rateLimiter, executor);
+
+
         List<SlashCommandHandler> commandHandlers = List.of(
                 new CloudCommand(),
                 new AskCommand(chatService, rateLimiter),
-                new ConversationCommand()
+                new ConversationCommand(rateLimiter, conversationManager, chatService, executor)
         );
 
         SlashCommandListener slashCommandListener = new SlashCommandListener(commandHandlers);
@@ -52,12 +62,13 @@ public class Cloud {
                 .setMemberCachePolicy(MemberCachePolicy.NONE)
                 .setChunkingFilter(ChunkingFilter.NONE)
                 .disableCache(EnumSet.allOf(CacheFlag.class))
-                .addEventListeners(slashCommandListener)
+                .addEventListeners(slashCommandListener, conversationListener)
                 .build();
 
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             LOG.info("Shutting down Cloud bot...");
             jda.shutdown();
+            conversationManager.close();
             try {
                 if (!jda.awaitShutdown(Duration.ofSeconds(10))) {
                     LOG.warn("JDA did not shutdown within 10 seconds, forcing shutdown...");
@@ -74,6 +85,9 @@ public class Cloud {
                 LOG.warn("Error closing Gemini client", e);
             }
         }, "cloud-shutdown-hook"));
+
+        //Start scheduled tasks
+        conversationManager.initiateScheduledTasks();
 
         try {
             jda.awaitReady();

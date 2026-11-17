@@ -9,10 +9,13 @@ import com.google.genai.types.GenerateContentResponse;
 import com.google.genai.types.GenerateContentResponsePromptFeedback;
 import com.google.genai.types.Part;
 import dev.romulus_lanceues.config.GeminiConfig;
+import dev.romulus_lanceues.memory.ConversationTurn;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
@@ -61,6 +64,58 @@ public class GeminiChatService implements ChatService {
                     }
                     return handleResponse(response);
                 });
+    }
+
+    @Override
+    public CompletableFuture<String> reply(List<ConversationTurn> conversationHistory){
+
+        Objects.requireNonNull(conversationHistory, "conversationHistory must not be null");
+        if(conversationHistory.isEmpty()) throw new IllegalArgumentException("conversationHistory must not be empty");
+
+        GenerateContentConfig genConfig = GenerateContentConfig.builder()
+                .temperature(config.temperature())
+                .topP(config.topP())
+                .topK(config.topK())
+                .maxOutputTokens(config.maxOutputTokens())
+                .systemInstruction(Content.fromParts(Part.fromText(config.systemInstruction())))
+                .build();
+
+
+        List<Content> conversationContext = new ArrayList<>();
+
+        for(ConversationTurn conversationTurn : conversationHistory){
+
+            //The message came from the user
+            if(!conversationTurn.isBot()){
+                String text = "["+ conversationTurn.speaker() + "]: " + conversationTurn.content();
+
+                Content message = Content.builder()
+                        .role("user")
+                        .parts(Part.fromText(text))
+                        .build();
+
+                conversationContext.add(message);
+            }
+            //Message came from cloud
+            else{
+                Content message = Content.builder()
+                        .role("model")
+                        .parts(Part.fromText(conversationTurn.content()))
+                        .build();
+
+                conversationContext.add(message);
+            }
+        }
+
+        return client.async.models.generateContent(config.model(), conversationContext, genConfig)
+                .orTimeout(timeout.toSeconds(), TimeUnit.SECONDS)
+                .handle((response, throwable) -> {
+                    if (throwable != null) {
+                        return handleException(throwable);
+                    }
+                    return handleResponse(response);
+                });
+
     }
 
     private String handleResponse(GenerateContentResponse response) {
