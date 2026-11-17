@@ -2,6 +2,7 @@ package dev.romulus_lanceues.discord.commands;
 
 import dev.romulus_lanceues.ai.ChatService;
 import dev.romulus_lanceues.discord.SlashCommandHandler;
+import dev.romulus_lanceues.discord.TypingIndicator;
 import dev.romulus_lanceues.memory.ConversationManager;
 import dev.romulus_lanceues.memory.ConversationSession;
 import dev.romulus_lanceues.memory.ConversationTurn;
@@ -23,6 +24,7 @@ import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ScheduledExecutorService;
 
 public class ConversationCommand implements SlashCommandHandler {
 
@@ -40,11 +42,14 @@ public class ConversationCommand implements SlashCommandHandler {
     private final RateLimiter rateLimiter;
     private final ConversationManager conversationManager;
     private final ChatService chatService;
+    private final ScheduledExecutorService scheduler;
 
-    public ConversationCommand(RateLimiter rateLimiter, ConversationManager conversationManager, ChatService chatService) {
+    public ConversationCommand(RateLimiter rateLimiter, ConversationManager conversationManager,
+                               ChatService chatService, ScheduledExecutorService scheduler) {
         this.rateLimiter = Objects.requireNonNull(rateLimiter, "Rate Limiter should not be null");
         this.conversationManager = Objects.requireNonNull(conversationManager, "Conversation Manager should not be null");
         this.chatService = Objects.requireNonNull(chatService, "Chat Service should not be null");
+        this.scheduler = Objects.requireNonNull(scheduler, "Scheduler should not be null");
     }
 
     @Override
@@ -114,9 +119,11 @@ public class ConversationCommand implements SlashCommandHandler {
                                     ConversationSession createdSession = registerConversation(thread.getIdLong(), promptOption.getAsString(), event.getUser().getName());
                                     LOG.info("Conversation {} has been created!",createdSession);
 
+                                    TypingIndicator typing = new TypingIndicator(thread, conversationManager, createdSession, scheduler);
                                     try {
+                                        typing.start();
                                         CompletableFuture<Void> workflow = chatService.reply(createdSession.getActiveTurns())
-                                                .thenCompose(result -> handleDeliveryAndRecord(result, thread));
+                                                .thenCompose(result -> handleDeliveryAndRecord(result, thread, createdSession));
 
                                         workflow.whenComplete((ignored, failure) -> {
                                             try{
@@ -127,7 +134,11 @@ public class ConversationCommand implements SlashCommandHandler {
                                                             .queue();
                                                 }
                                             } finally {
-                                                createdSession.releaseLock();
+                                                try {
+                                                    typing.close();
+                                                } finally {
+                                                    createdSession.releaseLock();
+                                                }
                                             }
 
                                         });
@@ -139,7 +150,11 @@ public class ConversationCommand implements SlashCommandHandler {
                                                     .queue();
                                         }
                                         finally {
-                                            createdSession.releaseLock();
+                                            try {
+                                                typing.close();
+                                            } finally {
+                                                createdSession.releaseLock();
+                                            }
                                         }
                                     }
 
@@ -163,7 +178,15 @@ public class ConversationCommand implements SlashCommandHandler {
        );
     }
 
-    private CompletableFuture<Void> handleDeliveryAndRecord(String result, ThreadChannel thread){
+    private boolean canRespond(ConversationSession session) {
+        synchronized (session) {
+            return conversationManager.getSession(session.getThreadId()).orElse(null) == session
+                    && session.verifyStateEligibility(ConversationManager.TIME_TO_LIVE_DURATION);
+        }
+    }
+
+    private CompletableFuture<Void> handleDeliveryAndRecord(String result, ThreadChannel thread, ConversationSession session){
+        if (!canRespond(session)) return CompletableFuture.completedFuture(null);
 
         List<String> chunks =  MessageSplitter.split(result, MAX_PROMPT_PREVIEW_LENGTH);
 
@@ -177,15 +200,22 @@ public class ConversationCommand implements SlashCommandHandler {
 
             for (String chunk : chunks) {
                 delivery = delivery.thenCompose(ignored -> {
-                     return thread.sendMessage(chunk)
+                    synchronized (session) {
+                        if (!canRespond(session)) return CompletableFuture.completedFuture(null);
+                        return thread.sendMessage(chunk)
                             .setAllowedMentions(Collections.emptyList())
+                            .setCheck(() -> canRespond(session))
                             .submit();
+                    }
                 });
             }
 
             return delivery.thenRun(() -> {
-                String deliveredText = String.join("\n", chunks);
-                conversationManager.insertSessionTurn(thread.getIdLong(), ConversationTurn.bot(deliveredText));
+                synchronized (session) {
+                    if (!canRespond(session)) return;
+                    String deliveredText = String.join("\n", chunks);
+                    conversationManager.insertSessionTurn(thread.getIdLong(), ConversationTurn.bot(deliveredText));
+                }
             });
 
     }

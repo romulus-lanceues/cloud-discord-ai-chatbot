@@ -37,7 +37,13 @@ import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
+import java.util.function.BooleanSupplier;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.CancellationException;
+import org.mockito.ArgumentCaptor;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.*;
@@ -60,6 +66,10 @@ class ConversationCommandTest {
     private ThreadChannelAction creation;
     private RestAction<Void> addition;
     private User user;
+    private ScheduledExecutorService scheduler;
+    private ScheduledFuture<?> refreshTask;
+    private Runnable refreshTick;
+    private RestAction<Void> typingAction;
     private final List<String> submitted = new ArrayList<>();
     private final List<CompletableFuture<Message>> sendResults = new ArrayList<>();
     private final List<MessageCreateAction> sendActions = new ArrayList<>();
@@ -69,10 +79,17 @@ class ConversationCommandTest {
     void setUp() {
         Clock clock = Clock.fixed(Instant.parse("2026-01-01T12:00:00Z"), ZoneOffset.UTC);
         manager = spy(new ConversationManager(clock, mock(ScheduledExecutorService.class)));
+        scheduler = mock(ScheduledExecutorService.class);
+        refreshTask = mock(ScheduledFuture.class);
+        when(scheduler.scheduleWithFixedDelay(any(Runnable.class), eq(5L), eq(5L), eq(TimeUnit.SECONDS)))
+                .thenAnswer(call -> {
+                    refreshTick = call.getArgument(0);
+                    return refreshTask;
+                });
         chat = new FakeChatService();
         limiter = mock(RateLimiter.class);
         when(limiter.checkCooldown(USER_ID)).thenReturn(Optional.empty());
-        command = new ConversationCommand(limiter, manager, chat);
+        command = new ConversationCommand(limiter, manager, chat, scheduler);
         event = mock(SlashCommandInteractionEvent.class);
         when(event.getChannelType()).thenReturn(ChannelType.TEXT);
         user = mock(User.class);
@@ -98,6 +115,12 @@ class ConversationCommandTest {
         when(parent.createThreadChannel(anyString())).thenReturn(creation);
         thread = mock(ThreadChannel.class);
         when(thread.getIdLong()).thenReturn(THREAD_ID);
+        typingAction = mock(RestAction.class, RETURNS_SELF);
+        when(thread.sendTyping()).thenReturn(typingAction);
+        doAnswer(call -> {
+            call.<Consumer<Void>>getArgument(0).accept(null);
+            return null;
+        }).when(typingAction).queue(any(), any());
         when(thread.getAsMention()).thenReturn(LINK);
         doAnswer(call -> {
             call.<Consumer<ThreadChannel>>getArgument(0).accept(thread);
@@ -141,9 +164,10 @@ class ConversationCommandTest {
 
     @Test
     void requiresDependencies() {
-        assertThrows(NullPointerException.class, () -> new ConversationCommand(null, manager, chat));
-        assertThrows(NullPointerException.class, () -> new ConversationCommand(limiter, null, chat));
-        assertThrows(NullPointerException.class, () -> new ConversationCommand(limiter, manager, null));
+        assertThrows(NullPointerException.class, () -> new ConversationCommand(null, manager, chat, scheduler));
+        assertThrows(NullPointerException.class, () -> new ConversationCommand(limiter, null, chat, scheduler));
+        assertThrows(NullPointerException.class, () -> new ConversationCommand(limiter, manager, null, scheduler));
+        assertThrows(NullPointerException.class, () -> new ConversationCommand(limiter, manager, chat, null));
     }
 
     @ParameterizedTest
@@ -412,6 +436,190 @@ class ConversationCommandTest {
         assertGuardReleased();
     }
 
+    @Test
+    void initialResponseTypesImmediatelyAndRefreshesUntilDeliveryCompletes() {
+        CompletableFuture<String> generated = new CompletableFuture<>();
+        chat.response = generated;
+        sendResults.add(new CompletableFuture<>());
+        doAnswer(call -> {
+            if (refreshTick == null) { // The immediate indication precedes scheduling and generation.
+                assertEquals(0, chat.calls);
+                assertGuardHeld();
+            }
+            call.<Consumer<Void>>getArgument(0).accept(null);
+            return null;
+        }).when(typingAction).queue(any(), any());
+
+        command.handle(event);
+
+        verify(thread).sendTyping();
+        assertNotNull(refreshTick);
+        refreshTick.run();
+        refreshTick.run();
+        verify(thread, times(3)).sendTyping();
+        generated.complete("Answer");
+        refreshTick.run(); // Continue while Discord delivery is pending.
+        verify(thread, times(4)).sendTyping();
+        verify(refreshTask, never()).cancel(anyBoolean());
+        sendResults.getFirst().complete(mock(Message.class));
+        verify(refreshTask).cancel(false);
+        refreshTick.run();
+        verify(thread, times(4)).sendTyping();
+        assertGuardReleased();
+        verify(scheduler, never()).shutdown();
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"synchronous-generation", "asynchronous-generation", "empty-answer", "delivery", "recording", "notification"})
+    void initialResponseFailuresCancelTypingRefresh(String stage) {
+        IllegalStateException failure = new IllegalStateException("Response failed");
+        switch (stage) {
+            case "synchronous-generation" -> chat.startFailure = failure;
+            case "asynchronous-generation" -> chat.response = CompletableFuture.failedFuture(failure);
+            case "empty-answer" -> chat.response = CompletableFuture.completedFuture("");
+            case "delivery" -> sendResults.add(CompletableFuture.failedFuture(failure));
+            case "recording" -> doThrow(failure).when(manager).insertSessionTurn(eq(THREAD_ID), any());
+            case "notification" -> {
+                chat.response = CompletableFuture.failedFuture(failure);
+                doThrow(new IllegalStateException("Notification failed")).when(hook).editOriginal(DELIVERY_ERROR);
+            }
+        }
+
+        command.handle(event);
+
+        verify(refreshTask).cancel(false);
+        refreshTick.run();
+        verify(thread, times(1)).sendTyping();
+        assertGuardReleased();
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"creation", "submission", "callback"})
+    void typingFailuresDoNotInterruptInitialAnswer(String stage) {
+        CompletableFuture<String> generated = new CompletableFuture<>();
+        chat.response = generated;
+        AtomicReference<Consumer<Throwable>> failureCallback = new AtomicReference<>();
+        RuntimeException failure = new IllegalStateException("Typing failed");
+        switch (stage) {
+            case "creation" -> when(thread.sendTyping()).thenThrow(failure);
+            case "submission" -> doThrow(failure).when(typingAction).queue(any(), any());
+            case "callback" -> doAnswer(call -> {
+                failureCallback.set(call.getArgument(1));
+                return null;
+            }).when(typingAction).queue(any(), any());
+        }
+        command.handle(event);
+        if (failureCallback.get() != null) failureCallback.get().accept(failure);
+
+        assertEquals(1, chat.calls);
+        assertGuardHeld();
+        verify(hook, never()).editOriginal(DELIVERY_ERROR);
+        generated.complete("Answer");
+        assertEquals(List.of("Answer"), submitted);
+        verify(refreshTask).cancel(false);
+        assertGuardReleased();
+    }
+
+    @Test
+    void schedulingFailureDoesNotInterruptInitialAnswer() {
+        when(scheduler.scheduleWithFixedDelay(any(Runnable.class), anyLong(), anyLong(), any()))
+                .thenThrow(new java.util.concurrent.RejectedExecutionException("Scheduler stopped"));
+        command.handle(event);
+        assertEquals(List.of("Hola"), submitted);
+        verify(hook, never()).editOriginal(DELIVERY_ERROR);
+        assertGuardReleased();
+    }
+
+    @Test
+    void typingWaitsForSuccessfulMemberAddition() {
+        AtomicReference<Consumer<Void>> added = new AtomicReference<>();
+        doAnswer(call -> {
+            added.set(call.getArgument(0));
+            return null;
+        }).when(addition).queue(any(), any());
+
+        command.handle(event);
+
+        verify(thread, never()).sendTyping();
+        verifyNoInteractions(scheduler);
+        assertEquals(0, chat.calls);
+        added.get().accept(null);
+        verify(thread).sendTyping();
+        assertEquals(List.of("Hola"), submitted);
+        verify(refreshTask).cancel(false);
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void retiredInitialResponseStopsTypingAndDoesNotSendIntoArchivedOrReplacementSession(boolean replace) {
+        CompletableFuture<String> generated = new CompletableFuture<>();
+        chat.response = generated;
+        command.handle(event);
+        ConversationSession original = session();
+        manager.removeSession(THREAD_ID); // The archive listener retires/removes the session this way.
+        ConversationSession replacement = replace ? manager.createSession(THREAD_ID, "New instructions", "Bob") : null;
+
+        refreshTick.run();
+        generated.complete("Late answer");
+
+        verify(thread, times(1)).sendTyping();
+        verify(refreshTask, times(1)).cancel(false);
+        verify(thread, never()).sendMessage(anyString());
+        assertTrue(original.getTurns().isEmpty());
+        assertTrue(original.tryAcquireLock());
+        original.releaseLock();
+        if (replacement != null) {
+            assertTrue(replacement.getTurns().isEmpty());
+            assertFalse(replacement.tryAcquireLock());
+            replacement.releaseLock();
+        }
+    }
+
+    @Test
+    void queuedInitialResponseAndTypingAreCanceledAfterRetirement() {
+        sendResults.add(new CompletableFuture<>());
+        command.handle(event);
+        ConversationSession original = session();
+        ArgumentCaptor<BooleanSupplier> typingCheck = ArgumentCaptor.forClass(BooleanSupplier.class);
+        ArgumentCaptor<BooleanSupplier> sendCheck = ArgumentCaptor.forClass(BooleanSupplier.class);
+        verify(typingAction).setCheck(typingCheck.capture());
+        verify(sendActions.getFirst()).setCheck(sendCheck.capture());
+        assertTrue(typingCheck.getValue().getAsBoolean());
+        assertTrue(sendCheck.getValue().getAsBoolean());
+
+        manager.removeSession(THREAD_ID);
+
+        assertFalse(typingCheck.getValue().getAsBoolean());
+        assertFalse(sendCheck.getValue().getAsBoolean());
+        sendResults.getFirst().completeExceptionally(new CancellationException("Session retired"));
+        verify(refreshTask).cancel(false);
+        assertTrue(original.getTurns().isEmpty());
+        assertTrue(original.tryAcquireLock());
+        original.releaseLock();
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void retirementDuringInitialDeliveryStopsLaterChunksAndTyping(boolean sendFails) {
+        chat.response = CompletableFuture.completedFuture("a".repeat(4010));
+        sendResults.add(new CompletableFuture<>());
+        command.handle(event);
+        ConversationSession original = session();
+        assertEquals(1, submitted.size());
+        manager.removeSession(THREAD_ID);
+
+        if (sendFails) sendResults.getFirst().completeExceptionally(new IllegalStateException("Send failed"));
+        else sendResults.getFirst().complete(mock(Message.class));
+
+        assertEquals(1, submitted.size());
+        assertTrue(original.getTurns().isEmpty());
+        verify(refreshTask).cancel(false);
+        refreshTick.run();
+        verify(thread, times(1)).sendTyping();
+        assertTrue(original.tryAcquireLock());
+        original.releaseLock();
+    }
+
     private void assertGuardHeld() {
         assertFalse(session().tryAcquireLock(), "Initial response must retain its guard until work finishes");
     }
@@ -437,7 +645,7 @@ class ConversationCommandTest {
         verify(reply).setEphemeral(true);
         verify(reply).queue();
         verify(event, never()).deferReply();
-        verifyNoInteractions(limiter, parent, manager);
+        verifyNoInteractions(limiter, parent, manager, scheduler);
         assertEquals(0, chat.calls);
     }
 
